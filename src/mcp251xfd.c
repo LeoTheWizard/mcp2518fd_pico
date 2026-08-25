@@ -262,16 +262,18 @@ enum mcp251xfd_iocon_bits
 // CiTEFCON register (0x0040) bit positions.
 enum mcp251xfd_tefcon_bits
 {
-    MCP251XFD_TEFCON_FSIZE_MASK = (0x1F << 0), // TEF depth (0=1 entry, 31=32 entries).
-    MCP251XFD_TEFCON_TXTS = (1 << 5),          // Record TX timestamp in each TEF entry.
-    MCP251XFD_TEFCON_RXOVIE = (1 << 8),        // Overflow interrupt enable.
-    MCP251XFD_TEFCON_TEFERFFIE = (1 << 10),    // Full interrupt enable.
-    MCP251XFD_TEFCON_TEFHRFHIE = (1 << 11),    // Half-full interrupt enable.
-    MCP251XFD_TEFCON_TEFNRFNIE = (1 << 12),    // Not-full interrupt enable.
-    MCP251XFD_TEFCON_FRESET = (1 << 13),       // Reset head/tail pointers.
-    MCP251XFD_TEFCON_UINC = (1 << 14),         // User increment — advance read pointer.
+    // Per MCP251xFD datasheet section 4.4.4 (CiTEFCON register); the layout matches
+    // CiFIFOCONm bit for bit, so keep the two enums aligned.
+    MCP251XFD_TEFCON_TEFNRFNIE = (1 << 0),      // Not-empty interrupt enable.
+    MCP251XFD_TEFCON_TEFHRFHIE = (1 << 1),      // Half-full interrupt enable.
+    MCP251XFD_TEFCON_TEFERFFIE = (1 << 2),      // Full interrupt enable.
+    MCP251XFD_TEFCON_RXOVIE = (1 << 3),         // Overflow interrupt enable.
+    MCP251XFD_TEFCON_TXTS = (1 << 5),           // Record TX timestamp in each TEF entry.
+    MCP251XFD_TEFCON_UINC = (1 << 8),           // User increment — advance read pointer.
+    MCP251XFD_TEFCON_FRESET = (1 << 10),        // Reset head/tail pointers.
+    MCP251XFD_TEFCON_FSIZE_MASK = (0x1F << 24), // TEF depth (0=1 entry, 31=32 entries).
 };
-#define MCP251XFD_TEFCON_FSIZE_SFT 0
+#define MCP251XFD_TEFCON_FSIZE_SFT 24
 
 // CiTSCON register (0x0014) — Time Base Counter configuration.
 enum mcp251xfd_tscon_bits
@@ -957,6 +959,10 @@ mcp251xfd_return_t mcp251xfd_configure_fifo(MCP251XFD *dev, uint8_t fifo_num, co
     {
         fifocon |= MCP251XFD_FIFOCON_TFNRFNIE;
 
+        // CiINT.RXOVIF only aggregates FIFOs whose own overflow enable is set, so without
+        // this a dropped frame is silent even when RXOVIE is set in CiINTE.
+        fifocon |= MCP251XFD_FIFOCON_RXOVIE;
+
         // Capture the hardware Time Base Counter into each received object. This adds a
         // 4-byte timestamp word per object (accounted for in get_fifo_ram_usage); cache
         // the choice so the read path knows the object layout.
@@ -1345,7 +1351,13 @@ mcp251xfd_return_t mcp251xfd_transmit(MCP251XFD *dev, uint8_t fifo_num, const ca
     // A remote frame transmits its DLC but no data bytes.
     uint8_t data_len = remote ? 0 : can_frame_get_length(frame);
     if (data_len > 0)
-        mcp251xfd_write_register(dev, obj_addr + 8, frame->data, data_len);
+    {
+        // Message RAM is word-organised and rejects partial-word writes, so a payload
+        // whose length is not a multiple of four is rounded up. The trailing bytes stay
+        // within frame->data (64 bytes) and the receiver reads only the DLC's worth.
+        size_t word_len = (data_len + 3u) & ~3u;
+        mcp251xfd_write_register(dev, obj_addr + 8, frame->data, word_len);
+    }
 
     // Write only byte 1 of FIFOCON to strobe UINC (bit 8) + TXREQ (bit 9). A full word
     // write is rejected outside Config mode because it touches read-only fields.
@@ -1671,7 +1683,12 @@ mcp251xfd_return_t mcp251xfd_enable_tef(MCP251XFD *dev, const mcp251xfd_tef_conf
     uint32_t cicon = mcp251xfd_read_word(dev, MCP251XFD_REG_CICON);
     mcp251xfd_write_word(dev, MCP251XFD_REG_CICON, cicon | MCP251XFD_CICON_STEF);
 
-    uint32_t tefcon = ((uint32_t)(config->depth - 1) << MCP251XFD_TEFCON_FSIZE_SFT) | MCP251XFD_TEFCON_FRESET;
+    // TEFNRFNIE gates CiINT.TEFIF the same way TFNRFNIE gates RXIF for a receive FIFO:
+    // without it the summary flag never asserts and the TEF is never drained.
+    uint32_t tefcon = (((uint32_t)(config->depth - 1) << MCP251XFD_TEFCON_FSIZE_SFT) &
+                       MCP251XFD_TEFCON_FSIZE_MASK) |
+                      MCP251XFD_TEFCON_FRESET |
+                      MCP251XFD_TEFCON_TEFNRFNIE;
     if (config->timestamps)
         tefcon |= MCP251XFD_TEFCON_TXTS;
     mcp251xfd_write_word(dev, MCP251XFD_REG_CITEFCON, tefcon);
@@ -1718,9 +1735,10 @@ mcp251xfd_return_t mcp251xfd_read_tef(MCP251XFD *dev, mcp251xfd_tef_entry_t *ent
                            ? mcp251xfd_read_word(dev, obj_addr + 8)
                            : 0;
 
-    // Advance TEF read pointer.
-    uint32_t tefcon = mcp251xfd_read_word(dev, MCP251XFD_REG_CITEFCON);
-    mcp251xfd_write_word(dev, MCP251XFD_REG_CITEFCON, tefcon | MCP251XFD_TEFCON_UINC);
+    // Write only byte 1 of CiTEFCON to strobe UINC (bit 8). A full word write is rejected
+    // outside Config mode because it touches FSIZE, which is configuration-only.
+    const uint8_t uinc = 0x01;
+    mcp251xfd_write_register(dev, MCP251XFD_REG_CITEFCON + 1, &uinc, 1);
 
     return MCP251XFD_RETURN_OK;
 }
