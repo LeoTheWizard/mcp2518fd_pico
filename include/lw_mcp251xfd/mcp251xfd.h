@@ -130,6 +130,7 @@ typedef struct mcp251xfd_fifo_config
     uint8_t payload;     // Payload bytes reserved per object. Use mcp251xfd_plsize_t values.
     uint8_t tx_priority; // Arbitration priority 0–31, TX FIFOs only.
     bool auto_rtr;       // Auto-respond to remote frames, TX FIFOs only.
+    bool timestamps;     // RX FIFOs only: capture the hardware Time Base Counter into each received frame (adds 4 bytes per object). Requires the TBC to be enabled via mcp251xfd_configure_timestamp().
 } mcp251xfd_fifo_config_t;
 
 /**
@@ -802,7 +803,7 @@ typedef struct mcp251xfd_tef_entry
     uint32_t id;        // Frame identifier (11-bit or 29-bit depending on flags).
     uint8_t flags;      // Frame flags (EFF, FDF, BRS, ESI). Use can_frame_flags_t values.
     uint8_t dlc;        // Data length code of the transmitted frame.
-    uint16_t timestamp; // Hardware timestamp at transmission; valid only if TEF was configured with timestamps=true.
+    uint32_t timestamp; // Hardware Time Base Counter value at transmission; valid only if TEF was configured with timestamps=true.
 } mcp251xfd_tef_entry_t;
 
 /**
@@ -835,8 +836,26 @@ mcp251xfd_return_t mcp251xfd_read_tef(MCP251XFD *dev,
  */
 
 /**
+ * @brief Enables and configures the 32-bit hardware Time Base Counter (CiTSCON).
+ *
+ * The TBC is the single time source behind both RX frame timestamps (RXTSEN) and
+ * TEF entry timestamps. It increments once every (prescaler + 1) system-clock
+ * periods, so for a 1 µs tick set prescaler = (SYSCLK_Hz / 1_000_000) - 1
+ * (e.g. 39 for a 40 MHz SYSCLK). Call in configuration mode before going on-bus.
+ *
+ * @param dev       The MCP251xFD device instance.
+ * @param enable    true to run the counter (TBCEN), false to stop it.
+ * @param prescaler 10-bit clock prescaler (0–1023); ignored when enable is false.
+ *
+ * @return mcp251xfd_return_t indicating the result of the operation.
+ */
+mcp251xfd_return_t mcp251xfd_configure_timestamp(MCP251XFD *dev,
+                                                 bool enable,
+                                                 uint16_t prescaler);
+
+/**
  * @brief Reads the current value of the 32-bit hardware Time Base Counter (CiTBC).
- * The counter must have been enabled via CiTSCON.TBCEN before calling this function.
+ * The counter must have been enabled via mcp251xfd_configure_timestamp() first.
  *
  * @param dev       The MCP251xFD device instance.
  * @param timestamp Pointer to store the current counter value.

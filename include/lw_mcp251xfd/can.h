@@ -44,6 +44,7 @@ typedef struct can_frame
     uint8_t  flags;   // Frame flags: eff(0x01), fd(0x02), brs(0x04), esi(0x08), rtr(0x10). Use can_frame_flags_t values.
     uint8_t  dlc;     // Data length code, past 8 bytes does not match the length of the frame itself. refer to dlc_map.
     uint8_t  data[64]; // Frame payload data buffer.
+    uint32_t timestamp; // Hardware Time Base Counter value captured at receive; valid only when the RX FIFO enabled timestamps, 0 otherwise. Unused on transmit.
 } can_frame_t;
 
 /**

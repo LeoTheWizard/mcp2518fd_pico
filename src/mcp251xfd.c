@@ -273,6 +273,14 @@ enum mcp251xfd_tefcon_bits
 };
 #define MCP251XFD_TEFCON_FSIZE_SFT 0
 
+// CiTSCON register (0x0014) — Time Base Counter configuration.
+enum mcp251xfd_tscon_bits
+{
+    MCP251XFD_TSCON_TBCPRE_MASK = (0x3FF << 0), // Time base counter prescaler (bits 9:0).
+    MCP251XFD_TSCON_TBCEN = (1 << 16),          // Time base counter enable.
+    MCP251XFD_TSCON_TSEOF = (1 << 17),          // 1 = timestamp at end of frame, 0 = at start.
+};
+
 // CiTEFSTA register (0x0044) bit positions.
 enum mcp251xfd_tefsta_bits
 {
@@ -359,6 +367,7 @@ struct mcp2518fd_priv
     mcp251xfd_fosc_t sysclk;
     mcp251xfd_model_t model;
     bool tef_timestamps; // True if TEF was configured with timestamps=true.
+    uint32_t rx_timestamp_mask; // Bit (fifo_num - 1) set if that RX FIFO captures hardware timestamps.
     bool use_crc;        // Route register access through CRC commands (enabled after osc bring-up).
     bool crc_error;      // Sticky: set when a CRC read fails after all retries.
 };
@@ -869,7 +878,12 @@ mcp251xfd_return_t mcp251xfd_set_bit_timing(MCP251XFD *dev,
 
 uint32_t mcp251xfd_get_fifo_ram_usage(const mcp251xfd_fifo_config_t *config)
 {
-    return (uint32_t)config->depth * (8u + (uint32_t)config->payload);
+    // Each object is an 8-byte header (T0+T1) + payload, plus a 4-byte timestamp
+    // word when RX timestamps are enabled.
+    uint32_t per_object = 8u + (uint32_t)config->payload;
+    if (!config->tx && config->timestamps)
+        per_object += 4u;
+    return (uint32_t)config->depth * per_object;
 }
 
 mcp251xfd_return_t mcp251xfd_configure_fifo(MCP251XFD *dev, uint8_t fifo_num, const mcp251xfd_fifo_config_t *config, uint32_t *ram_used)
@@ -940,7 +954,22 @@ mcp251xfd_return_t mcp251xfd_configure_fifo(MCP251XFD *dev, uint8_t fifo_num, co
     // always), so enabling it would wedge CiINT.TXIF permanently set. Callers that
     // want TX interrupts should enable them transiently when frames are queued.
     if (!config->tx)
+    {
         fifocon |= MCP251XFD_FIFOCON_TFNRFNIE;
+
+        // Capture the hardware Time Base Counter into each received object. This adds a
+        // 4-byte timestamp word per object (accounted for in get_fifo_ram_usage); cache
+        // the choice so the read path knows the object layout.
+        if (config->timestamps)
+        {
+            fifocon |= MCP251XFD_FIFOCON_RXTSEN;
+            dev->rx_timestamp_mask |= (1u << (fifo_num - 1));
+        }
+        else
+        {
+            dev->rx_timestamp_mask &= ~(1u << (fifo_num - 1));
+        }
+    }
 
     if (config->tx)
     {
@@ -1405,10 +1434,16 @@ static mcp251xfd_return_t mcp251xfd_read_rx_object(MCP251XFD *dev, uint8_t fifo_
         frame->flags |= CAN_FRAME_FLAG_ESI;
     frame->dlc = (uint8_t)(t1 & MCP251XFD_T1_DLC_MASK);
 
+    // When RXTSEN is set for this FIFO, a 32-bit timestamp word sits between the
+    // header (T0/T1) and the payload, shifting the data start from +8 to +12.
+    bool ts_enabled = (dev->rx_timestamp_mask >> (fifo_num - 1)) & 1u;
+    frame->timestamp = ts_enabled ? mcp251xfd_read_word(dev, obj_addr + 8) : 0;
+    uint16_t data_offset = ts_enabled ? 12 : 8;
+
     // A remote frame carries its DLC but no data bytes.
     uint8_t data_len = remote ? 0 : can_frame_get_length(frame);
     if (data_len > 0)
-        mcp251xfd_read_register(dev, obj_addr + 8, frame->data, data_len);
+        mcp251xfd_read_register(dev, obj_addr + data_offset, frame->data, data_len);
 
     // Advance FIFO tail pointer — byte write to avoid disturbing config-protected bits.
     // UINC (bit 8 = byte 1 bit 0)
@@ -1677,9 +1712,10 @@ mcp251xfd_return_t mcp251xfd_read_tef(MCP251XFD *dev, mcp251xfd_tef_entry_t *ent
     if (t1 & MCP251XFD_T1_ESI)
         entry->flags |= CAN_FRAME_FLAG_ESI;
     entry->dlc = (uint8_t)(t1 & MCP251XFD_T1_DLC_MASK);
-    // TEF timestamp is in T2 (word at +8), not T1[31:16] (which is SEQ in TEF format).
+    // TEF timestamp is the full 32-bit TBC capture in T2 (word at +8), not T1[31:16]
+    // (which is SEQ in TEF format).
     entry->timestamp = dev->tef_timestamps
-                           ? (uint16_t)(mcp251xfd_read_word(dev, obj_addr + 8) & 0xFFFF)
+                           ? mcp251xfd_read_word(dev, obj_addr + 8)
                            : 0;
 
     // Advance TEF read pointer.
@@ -1692,6 +1728,19 @@ mcp251xfd_return_t mcp251xfd_read_tef(MCP251XFD *dev, mcp251xfd_tef_entry_t *ent
 #pragma endregion
 
 #pragma region Time Base Counter
+
+mcp251xfd_return_t mcp251xfd_configure_timestamp(MCP251XFD *dev, bool enable, uint16_t prescaler)
+{
+    CHECK_NULL_PARAM(dev);
+
+    uint32_t tscon = 0;
+    if (enable)
+        tscon = MCP251XFD_TSCON_TBCEN |
+                ((uint32_t)prescaler << 0 & MCP251XFD_TSCON_TBCPRE_MASK);
+
+    mcp251xfd_write_word(dev, MCP251XFD_REG_CITSCON, tscon);
+    return MCP251XFD_RETURN_OK;
+}
 
 mcp251xfd_return_t mcp251xfd_get_timestamp(MCP251XFD *dev, uint32_t *timestamp)
 {
